@@ -1,0 +1,28 @@
+[package]
+name = "subtrack"
+version = "1.0.0"
+edition = "2021"
+description = "Self-hosted subscription tracker"
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rust-embed = "8"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+csv = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mime_guess = "2"
+tower = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
