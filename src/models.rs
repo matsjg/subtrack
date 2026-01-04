@@ -148,3 +148,97 @@ pub struct CsvSubscription {
     pub notes: Option<String>,
     pub reminder_days: Option<i32>,
 }
+
+// Gmail integration models
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmailAccount {
+    pub id: Option<i64>,
+    pub email: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_expiry: i64,
+    pub created_at: Option<i64>,
+    pub last_scan_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryStatus {
+    Pending,
+    Accepted,
+    Ignored,
+}
+
+impl DiscoveryStatus {
+    pub fn to_str(&self) -> &str {
+        match self {
+            DiscoveryStatus::Pending => "pending",
+            DiscoveryStatus::Accepted => "accepted",
+            DiscoveryStatus::Ignored => "ignored",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "pending" => Ok(DiscoveryStatus::Pending),
+            "accepted" => Ok(DiscoveryStatus::Accepted),
+            "ignored" => Ok(DiscoveryStatus::Ignored),
+            _ => Err(format!("Invalid discovery status: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredSubscription {
+    pub id: Option<i64>,
+    pub gmail_account_id: i64,
+    pub sender_email: String,
+    pub sender_name: Option<String>,
+    pub domain: String,
+    pub email_count: i32,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub status: DiscoveryStatus,
+    pub linked_subscription_id: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanResult {
+    pub total_emails_scanned: u32,
+    pub new_discoveries: u32,
+    pub updated_discoveries: u32,
+    pub scan_duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScannerConfig {
+    pub max_results_per_query: u32,
+    pub lookback_days: u32,
+    pub min_email_threshold: u32,
+    pub custom_queries: Vec<String>,
+    pub excluded_domains: Vec<String>,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self {
+            max_results_per_query: 500,
+            lookback_days: 365,
+            min_email_threshold: 2,
+            custom_queries: Vec::new(),
+            excluded_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcceptDiscoveryRequest {
+    pub name: String,
+    pub cost: f64,
+    pub billing_cycle: BillingCycle,
+    pub renewal_date: String,
+    pub category: Option<String>,
+    pub notes: Option<String>,
+    pub reminder_days: Option<i32>,
+}

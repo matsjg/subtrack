@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod error;
+mod gmail;
 mod handlers;
 mod models;
 
@@ -94,6 +95,15 @@ async fn main() {
         .route("/summary", get(handlers::summary::get_summary))
         .route("/export", get(handlers::import_export::export_csv))
         .route("/import", post(handlers::import_export::import_csv))
+        // Gmail integration routes
+        .route("/gmail/connect", post(handlers::gmail::connect_gmail))
+        .route("/gmail/accounts", get(handlers::gmail::list_gmail_accounts))
+        .route("/gmail/:account_id/scan", post(handlers::gmail::scan_gmail))
+        .route("/gmail/:account_id/discoveries", get(handlers::gmail::list_discoveries))
+        .route("/gmail/:account_id/disconnect", axum::routing::delete(handlers::gmail::disconnect_gmail))
+        .route("/discoveries/:discovery_id/accept", post(handlers::gmail::accept_discovery))
+        .route("/discoveries/:discovery_id/ignore", post(handlers::gmail::ignore_discovery))
+        .route("/discoveries/:discovery_id", axum::routing::delete(handlers::gmail::delete_discovery))
         .with_state(pool);
 
     // Build main app with static file serving

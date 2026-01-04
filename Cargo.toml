@@ -21,6 +21,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mime_guess = "2"
 tower = "0.4"
 
+# Gmail integration
+google-gmail1 = "5.0"
+yup-oauth2 = "10.0"
+hyper = "1.0"
+hyper-rustls = { version = "0.27", features = ["webpki-roots"] }
+hyper-util = { version = "0.1", features = ["full"] }
+regex = "1"
+url = "2"
+base64 = "0.22"
+
 [profile.release]
 lto = true
 codegen-units = 1

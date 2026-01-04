@@ -1,6 +1,7 @@
 use crate::error::AppError;
 use crate::models::{
-    BillingCycle, CategorySummary, Subscription, SubscriptionStatus, Summary, UpcomingRenewal,
+    BillingCycle, CategorySummary, DiscoveredSubscription, DiscoveryStatus, GmailAccount,
+    Subscription, SubscriptionStatus, Summary, UpcomingRenewal,
 };
 use chrono::{NaiveDate, Utc};
 use rusqlite::{params, Connection, Result};
@@ -35,6 +36,38 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
         CREATE INDEX IF NOT EXISTS idx_subscriptions_renewal ON subscriptions(renewal_date);
         CREATE INDEX IF NOT EXISTS idx_subscriptions_category ON subscriptions(category);
+
+        -- Gmail integration tables
+        CREATE TABLE IF NOT EXISTS gmail_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            token_expiry INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            last_scan_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS discovered_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gmail_account_id INTEGER NOT NULL,
+            sender_email TEXT NOT NULL,
+            sender_name TEXT,
+            domain TEXT NOT NULL,
+            email_count INTEGER DEFAULT 1,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'ignored')),
+            linked_subscription_id INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (gmail_account_id) REFERENCES gmail_accounts(id) ON DELETE CASCADE,
+            FOREIGN KEY (linked_subscription_id) REFERENCES subscriptions(id) ON DELETE SET NULL,
+            UNIQUE (gmail_account_id, sender_email)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_discovered_status ON discovered_subscriptions(status);
+        CREATE INDEX IF NOT EXISTS idx_discovered_domain ON discovered_subscriptions(domain);
+        CREATE INDEX IF NOT EXISTS idx_discovered_gmail_account ON discovered_subscriptions(gmail_account_id);
         "#,
     )?;
     Ok(())
@@ -291,4 +324,204 @@ pub fn get_summary(pool: &DbPool) -> Result<Summary, AppError> {
         categories,
         upcoming_renewals,
     })
+}
+
+// Gmail account operations
+pub fn save_gmail_account(pool: &DbPool, account: &GmailAccount) -> Result<i64, AppError> {
+    let conn = pool.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO gmail_accounts (email, access_token, refresh_token, token_expiry)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            account.email,
+            account.access_token,
+            account.refresh_token,
+            account.token_expiry
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_gmail_account(pool: &DbPool, email: &str) -> Result<Option<GmailAccount>, AppError> {
+    let conn = pool.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, email, access_token, refresh_token, token_expiry, created_at, last_scan_at
+         FROM gmail_accounts WHERE email = ?1",
+    )?;
+
+    let result = stmt.query_row(params![email], |row| {
+        Ok(GmailAccount {
+            id: Some(row.get(0)?),
+            email: row.get(1)?,
+            access_token: row.get(2)?,
+            refresh_token: row.get(3)?,
+            token_expiry: row.get(4)?,
+            created_at: row.get(5)?,
+            last_scan_at: row.get(6)?,
+        })
+    });
+
+    match result {
+        Ok(account) => Ok(Some(account)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(AppError::Database(e)),
+    }
+}
+
+pub fn list_gmail_accounts(pool: &DbPool) -> Result<Vec<GmailAccount>, AppError> {
+    let conn = pool.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, email, access_token, refresh_token, token_expiry, created_at, last_scan_at
+         FROM gmail_accounts ORDER BY created_at DESC",
+    )?;
+
+    let accounts = stmt
+        .query_map([], |row| {
+            Ok(GmailAccount {
+                id: Some(row.get(0)?),
+                email: row.get(1)?,
+                access_token: row.get(2)?,
+                refresh_token: row.get(3)?,
+                token_expiry: row.get(4)?,
+                created_at: row.get(5)?,
+                last_scan_at: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(accounts)
+}
+
+pub fn update_gmail_scan_time(pool: &DbPool, account_id: i64) -> Result<(), AppError> {
+    let conn = pool.lock().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE gmail_accounts SET last_scan_at = ?1 WHERE id = ?2",
+        params![now, account_id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_gmail_account(pool: &DbPool, account_id: i64) -> Result<bool, AppError> {
+    let conn = pool.lock().unwrap();
+    let rows_affected = conn.execute("DELETE FROM gmail_accounts WHERE id = ?1", params![account_id])?;
+    Ok(rows_affected > 0)
+}
+
+// Discovered subscriptions operations
+pub fn upsert_discovered_subscription(
+    pool: &DbPool,
+    discovery: &DiscoveredSubscription,
+) -> Result<i64, AppError> {
+    let conn = pool.lock().unwrap();
+
+    // Try to insert or update
+    conn.execute(
+        "INSERT INTO discovered_subscriptions
+         (gmail_account_id, sender_email, sender_name, domain, email_count, first_seen_at, last_seen_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(gmail_account_id, sender_email) DO UPDATE SET
+         email_count = email_count + ?5,
+         last_seen_at = ?7,
+         sender_name = COALESCE(?3, sender_name)",
+        params![
+            discovery.gmail_account_id,
+            discovery.sender_email,
+            discovery.sender_name,
+            discovery.domain,
+            discovery.email_count,
+            discovery.first_seen_at,
+            discovery.last_seen_at,
+            discovery.status.to_str()
+        ],
+    )?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_discovered_subscriptions(
+    pool: &DbPool,
+    gmail_account_id: i64,
+    status_filter: Option<DiscoveryStatus>,
+) -> Result<Vec<DiscoveredSubscription>, AppError> {
+    let conn = pool.lock().unwrap();
+
+    let query = if status_filter.is_some() {
+        "SELECT id, gmail_account_id, sender_email, sender_name, domain, email_count,
+                first_seen_at, last_seen_at, status, linked_subscription_id, created_at
+         FROM discovered_subscriptions
+         WHERE gmail_account_id = ?1 AND status = ?2
+         ORDER BY email_count DESC, last_seen_at DESC"
+    } else {
+        "SELECT id, gmail_account_id, sender_email, sender_name, domain, email_count,
+                first_seen_at, last_seen_at, status, linked_subscription_id, created_at
+         FROM discovered_subscriptions
+         WHERE gmail_account_id = ?1
+         ORDER BY email_count DESC, last_seen_at DESC"
+    };
+
+    let mut stmt = conn.prepare(query)?;
+
+    let discoveries = if let Some(status) = status_filter {
+        stmt.query_map(params![gmail_account_id, status.to_str()], |row| {
+            Ok(DiscoveredSubscription {
+                id: Some(row.get(0)?),
+                gmail_account_id: row.get(1)?,
+                sender_email: row.get(2)?,
+                sender_name: row.get(3)?,
+                domain: row.get(4)?,
+                email_count: row.get(5)?,
+                first_seen_at: row.get(6)?,
+                last_seen_at: row.get(7)?,
+                status: DiscoveryStatus::from_str(&row.get::<_, String>(8)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                linked_subscription_id: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![gmail_account_id], |row| {
+            Ok(DiscoveredSubscription {
+                id: Some(row.get(0)?),
+                gmail_account_id: row.get(1)?,
+                sender_email: row.get(2)?,
+                sender_name: row.get(3)?,
+                domain: row.get(4)?,
+                email_count: row.get(5)?,
+                first_seen_at: row.get(6)?,
+                last_seen_at: row.get(7)?,
+                status: DiscoveryStatus::from_str(&row.get::<_, String>(8)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                linked_subscription_id: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(discoveries)
+}
+
+pub fn update_discovery_status(
+    pool: &DbPool,
+    discovery_id: i64,
+    status: DiscoveryStatus,
+    linked_subscription_id: Option<i64>,
+) -> Result<bool, AppError> {
+    let conn = pool.lock().unwrap();
+    let rows_affected = conn.execute(
+        "UPDATE discovered_subscriptions SET status = ?1, linked_subscription_id = ?2 WHERE id = ?3",
+        params![status.to_str(), linked_subscription_id, discovery_id],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+pub fn delete_discovered_subscription(pool: &DbPool, discovery_id: i64) -> Result<bool, AppError> {
+    let conn = pool.lock().unwrap();
+    let rows_affected = conn.execute(
+        "DELETE FROM discovered_subscriptions WHERE id = ?1",
+        params![discovery_id],
+    )?;
+    Ok(rows_affected > 0)
 }
