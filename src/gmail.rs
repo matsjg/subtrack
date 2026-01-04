@@ -1,87 +1,171 @@
 use crate::error::AppError;
-use crate::models::{DiscoveredSubscription, DiscoveryStatus, GmailAccount, ScanResult, ScannerConfig};
-use google_gmail1::{api::Scope, Gmail};
-use hyper::client::HttpConnector;
-use hyper_rustls::HttpsConnector;
+use crate::models::{DiscoveredSubscription, DiscoveryStatus, ScanResult, ScannerConfig};
 use regex::Regex;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+
+const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1";
+const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OAuthTokenResponse {
+    pub access_token: String,
+    pub expires_in: i64,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailListResponse {
+    messages: Option<Vec<MessageRef>>,
+    #[allow(dead_code)]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageRef {
+    id: String,
+    #[allow(dead_code)]
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GmailMessage {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    thread_id: String,
+    payload: Option<MessagePart>,
+    #[serde(rename = "internalDate")]
+    internal_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagePart {
+    headers: Option<Vec<MessageHeader>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageHeader {
+    name: String,
+    value: String,
+}
 
 pub struct GmailScanner {
-    hub: Gmail<HttpsConnector<HttpConnector>>,
+    client: Client,
+    access_token: String,
+    #[allow(dead_code)]
     account_email: String,
 }
 
 impl GmailScanner {
-    /// Create a new Gmail scanner with OAuth authentication
-    pub async fn new(
+    /// Create a new Gmail scanner with an access token
+    pub fn new(access_token: String, account_email: String) -> Result<Self, AppError> {
+        let client = Client::builder()
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            client,
+            access_token,
+            account_email,
+        })
+    }
+
+    /// Generate OAuth authorization URL for user to visit
+    pub fn get_auth_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+        format!(
+            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&state={}&prompt=consent",
+            OAUTH_AUTH_URL,
+            urlencoding::encode(client_id),
+            urlencoding::encode(redirect_uri),
+            urlencoding::encode("https://www.googleapis.com/auth/gmail.readonly"),
+            urlencoding::encode(state)
+        )
+    }
+
+    /// Exchange authorization code for access token
+    pub async fn exchange_code(
         client_id: &str,
         client_secret: &str,
-        account_email: &str,
-    ) -> Result<(Self, GmailAccount), AppError> {
-        // Create OAuth2 authenticator
-        let secret = yup_oauth2::ApplicationSecret {
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
-            auth_uri: "https://accounts.google.com/o/oauth2/auth".to_string(),
-            token_uri: "https://oauth2.googleapis.com/token".to_string(),
-            ..Default::default()
-        };
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<OAuthTokenResponse, AppError> {
+        let client = Client::new();
+        let params = [
+            ("code", code),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ];
 
-        let auth = InstalledFlowAuthenticator::builder(
-            secret,
-            InstalledFlowReturnMethod::HTTPRedirect,
-        )
-        .persist_tokens_to_disk("token_cache.json")
-        .build()
-        .await
-        .map_err(|e| AppError::Internal(format!("OAuth setup failed: {}", e)))?;
-
-        // Request Gmail read-only scope
-        let scopes = &[Scope::Readonly];
-        let token = auth
-            .token(scopes)
+        let response = client
+            .post(OAUTH_TOKEN_URL)
+            .form(&params)
+            .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to get OAuth token: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("OAuth token exchange failed: {}", e)))?;
 
-        // Create Gmail API client
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(
-                hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_webpki_roots()
-                    .https_or_http()
-                    .enable_http1()
-                    .build(),
-            );
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "OAuth token exchange failed: {}",
+                error_text
+            )));
+        }
 
-        let hub = Gmail::new(client, auth);
+        let token_response: OAuthTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse token response: {}", e)))?;
 
-        // Extract token details for storage
-        let gmail_account = GmailAccount {
-            id: None,
-            email: account_email.to_string(),
-            access_token: token.token().unwrap_or_default().to_string(),
-            refresh_token: String::new(), // Managed by yup-oauth2
-            token_expiry: token
-                .expiration_time()
-                .map(|t| t.timestamp())
-                .unwrap_or(0),
-            created_at: None,
-            last_scan_at: None,
-        };
+        Ok(token_response)
+    }
 
-        Ok((
-            Self {
-                hub,
-                account_email: account_email.to_string(),
-            },
-            gmail_account,
-        ))
+    /// Refresh an access token using refresh token
+    #[allow(dead_code)]
+    pub async fn refresh_token(
+        client_id: &str,
+        client_secret: &str,
+        refresh_token: &str,
+    ) -> Result<OAuthTokenResponse, AppError> {
+        let client = Client::new();
+        let params = [
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "refresh_token"),
+        ];
+
+        let response = client
+            .post(OAUTH_TOKEN_URL)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("Token refresh failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "Token refresh failed: {}",
+                error_text
+            )));
+        }
+
+        let token_response: OAuthTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse token response: {}", e)))?;
+
+        Ok(token_response)
     }
 
     /// Scan Gmail inbox for subscription-related emails
-    pub async fn scan(&self, config: &ScannerConfig) -> Result<ScanResult, AppError> {
+    pub async fn scan(&self, config: &ScannerConfig) -> Result<(ScanResult, Vec<DiscoveredSubscription>), AppError> {
         let start_time = Instant::now();
         let mut all_discoveries = Vec::new();
 
@@ -124,12 +208,14 @@ impl GmailScanner {
 
         let scan_duration = start_time.elapsed();
 
-        Ok(ScanResult {
+        let result = ScanResult {
             total_emails_scanned: total_emails,
             new_discoveries: discoveries.len() as u32,
             updated_discoveries: 0, // Will be set by database layer
             scan_duration_ms: scan_duration.as_millis() as u64,
-        })
+        };
+
+        Ok((result, discoveries))
     }
 
     /// Fetch messages matching a query
@@ -138,27 +224,40 @@ impl GmailScanner {
         query: &str,
         max_results: u32,
     ) -> Result<Vec<DiscoveredSubscription>, AppError> {
-        let result = self
-            .hub
-            .users()
-            .messages_list("me")
-            .q(query)
-            .max_results(max_results)
-            .doit()
+        let url = format!("{}/users/me/messages", GMAIL_API_BASE);
+
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .query(&[("q", query), ("maxResults", &max_results.to_string())])
+            .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Gmail API error: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("Gmail API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "Gmail API error {}: {}",
+                status, error_text
+            )));
+        }
+
+        let list_response: GmailListResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse Gmail response: {}", e)))?;
 
         let mut discoveries = Vec::new();
 
-        if let Some(messages) = result.1.messages {
+        if let Some(messages) = list_response.messages {
             for message_ref in messages.iter().take(max_results as usize) {
-                if let Some(id) = &message_ref.id {
-                    match self.fetch_message_details(id).await {
-                        Ok(Some(discovery)) => discoveries.push(discovery),
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch message {}: {}", id, e);
-                        }
+                match self.fetch_message_details(&message_ref.id).await {
+                    Ok(Some(discovery)) => discoveries.push(discovery),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch message {}: {}", message_ref.id, e);
                     }
                 }
             }
@@ -172,25 +271,37 @@ impl GmailScanner {
         &self,
         message_id: &str,
     ) -> Result<Option<DiscoveredSubscription>, AppError> {
-        let result = self
-            .hub
-            .users()
-            .messages_get("me", message_id)
-            .format("metadata")
-            .doit()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to get message: {}", e)))?;
+        let url = format!("{}/users/me/messages/{}", GMAIL_API_BASE, message_id);
 
-        let message = result.1;
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.access_token)
+            .query(&[("format", "metadata")])
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to fetch message: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let message: GmailMessage = response
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse message: {}", e)))?;
 
         // Extract "From" header
         if let Some(payload) = message.payload {
             if let Some(headers) = payload.headers {
                 for header in headers {
-                    if header.name.as_deref() == Some("From") {
-                        if let Some(from_value) = header.value {
-                            return Ok(self.parse_from_header(&from_value, message.internal_date));
-                        }
+                    if header.name.to_lowercase() == "from" {
+                        let timestamp = message
+                            .internal_date
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|ms| ms / 1000); // Convert ms to seconds
+
+                        return Ok(self.parse_from_header(&header.value, timestamp));
                     }
                 }
             }
@@ -225,7 +336,7 @@ impl GmailScanner {
         let domain = email.split('@').nth(1)?.to_string();
 
         let now = chrono::Utc::now().timestamp();
-        let seen_time = timestamp.unwrap_or(now) / 1000; // Convert ms to seconds
+        let seen_time = timestamp.unwrap_or(now);
 
         Some(DiscoveredSubscription {
             id: None,
@@ -269,5 +380,12 @@ impl GmailScanner {
         map.into_values()
             .filter(|d| d.email_count >= config.min_email_threshold as i32)
             .collect()
+    }
+}
+
+// Helper module for URL encoding
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
     }
 }

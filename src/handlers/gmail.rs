@@ -13,9 +13,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Deserialize)]
-pub struct ConnectGmailRequest {
+#[allow(dead_code)]
+pub struct OAuthCallbackQuery {
+    pub code: String,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InitiateOAuthRequest {
+    pub client_id: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OAuthUrlResponse {
+    pub auth_url: String,
+    pub state: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteOAuthRequest {
+    pub code: String,
     pub client_id: String,
     pub client_secret: String,
+    pub redirect_uri: String,
     pub email: String,
 }
 
@@ -31,10 +52,22 @@ pub struct ScanRequest {
     pub config: Option<ScannerConfig>,
 }
 
-/// Connect a Gmail account via OAuth
-pub async fn connect_gmail(
+/// Initiate OAuth flow - returns authorization URL for user to visit
+pub async fn initiate_oauth(
+    Json(req): Json<InitiateOAuthRequest>,
+) -> Result<Json<OAuthUrlResponse>, AppError> {
+    // Generate a random state for CSRF protection
+    let state = format!("{}", chrono::Utc::now().timestamp());
+
+    let auth_url = GmailScanner::get_auth_url(&req.client_id, &req.redirect_uri, &state);
+
+    Ok(Json(OAuthUrlResponse { auth_url, state }))
+}
+
+/// Complete OAuth flow - exchange code for token and save account
+pub async fn complete_oauth(
     State(pool): State<DbPool>,
-    Json(req): Json<ConnectGmailRequest>,
+    Json(req): Json<CompleteOAuthRequest>,
 ) -> Result<Json<GmailConnectionResponse>, AppError> {
     // Check if account already exists
     if let Some(_existing) = db::get_gmail_account(&pool, &req.email)? {
@@ -44,17 +77,31 @@ pub async fn connect_gmail(
         )));
     }
 
-    // Initialize Gmail scanner and authenticate
-    let (_scanner, mut gmail_account) =
-        GmailScanner::new(&req.client_id, &req.client_secret, &req.email)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to authenticate with Gmail: {}", e))
-            })?;
+    // Exchange authorization code for tokens
+    let token_response = GmailScanner::exchange_code(
+        &req.client_id,
+        &req.client_secret,
+        &req.code,
+        &req.redirect_uri,
+    )
+    .await?;
 
-    // Save account to database
+    // Calculate token expiry timestamp
+    let expires_at = chrono::Utc::now().timestamp() + token_response.expires_in;
+
+    // Create Gmail account record
+    let gmail_account = GmailAccount {
+        id: None,
+        email: req.email.clone(),
+        access_token: token_response.access_token,
+        refresh_token: token_response.refresh_token.unwrap_or_default(),
+        token_expiry: expires_at,
+        created_at: None,
+        last_scan_at: None,
+    };
+
+    // Save to database
     let account_id = db::save_gmail_account(&pool, &gmail_account)?;
-    gmail_account.id = Some(account_id);
 
     tracing::info!("Successfully connected Gmail account: {}", req.email);
 
@@ -95,22 +142,27 @@ pub async fn scan_gmail(
         .find(|a| a.id == Some(account_id))
         .ok_or_else(|| AppError::NotFound(format!("Gmail account {} not found", account_id)))?;
 
-    // Note: In a real implementation, we would need to properly reconstruct the scanner
-    // with saved OAuth tokens. For this MVP, we'll return a placeholder error message.
+    // Check if token is expired and needs refresh
+    let now = chrono::Utc::now().timestamp();
+    let access_token = if now >= account.token_expiry {
+        // Token expired, need to refresh
+        // Note: In production, you'd need to store client_id and client_secret
+        // For now, return error asking user to reconnect
+        return Err(AppError::Internal(
+            "Access token expired. Please reconnect your Gmail account.".to_string(),
+        ));
+    } else {
+        account.access_token.clone()
+    };
 
-    return Err(AppError::Internal(
-        "Gmail scanning requires proper OAuth token management. \
-         Please refer to the documentation for setting up Google Cloud credentials."
-            .to_string(),
-    ));
+    // Create scanner
+    let scanner = GmailScanner::new(access_token, account.email.clone())?;
 
-    // This is the intended implementation (commented out for now):
-    /*
-    let scanner = GmailScanner::from_account(&account).await?;
+    // Get scan configuration
     let config = req.config.unwrap_or_default();
 
     // Perform scan
-    let mut result = scanner.scan(&config).await?;
+    let (mut result, discoveries) = scanner.scan(&config).await?;
 
     // Save discovered subscriptions to database
     let mut new_count = 0;
@@ -140,7 +192,6 @@ pub async fn scan_gmail(
     result.updated_discoveries = updated_count;
 
     Ok(Json(result))
-    */
 }
 
 /// List discovered subscriptions
@@ -256,9 +307,6 @@ pub async fn disconnect_gmail(
             account_id
         )));
     }
-
-    // Clean up token cache file if it exists
-    let _ = std::fs::remove_file("token_cache.json");
 
     Ok(Json(json!({
         "success": true,

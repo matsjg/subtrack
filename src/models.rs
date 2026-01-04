@@ -214,6 +214,7 @@ pub struct ScanResult {
 #[derive(Debug, Deserialize)]
 pub struct ScannerConfig {
     pub max_results_per_query: u32,
+    #[allow(dead_code)]
     pub lookback_days: u32,
     pub min_email_threshold: u32,
     pub custom_queries: Vec<String>,

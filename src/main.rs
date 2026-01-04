@@ -96,7 +96,8 @@ async fn main() {
         .route("/export", get(handlers::import_export::export_csv))
         .route("/import", post(handlers::import_export::import_csv))
         // Gmail integration routes
-        .route("/gmail/connect", post(handlers::gmail::connect_gmail))
+        .route("/gmail/oauth/initiate", post(handlers::gmail::initiate_oauth))
+        .route("/gmail/oauth/complete", post(handlers::gmail::complete_oauth))
         .route("/gmail/accounts", get(handlers::gmail::list_gmail_accounts))
         .route("/gmail/:account_id/scan", post(handlers::gmail::scan_gmail))
         .route("/gmail/:account_id/discoveries", get(handlers::gmail::list_discoveries))
